@@ -53,6 +53,9 @@ concurrent: 10
 # 如果你的并发数量超过这个参数，那么成功的结果可能会大于这个数值
 # success-limit <= success <= success-limit+concurrent
 success-limit: 100
+# 单轮最多尝试检测的节点数，0 表示不设上限。可与 success-limit 配合，
+# 避免将某些来源排除在成功数限制外后仍检测整个超大节点池。
+max-total-tested: 0
 
 # 此选项将保存并加载 {上次检测成功的节点} 和 {历次检测成功的节点}
 # 如果为true，则保留之前测试成功的节点
@@ -538,3 +541,27 @@ sub-urls:
   - 'https://raw.githubusercontent.com/PangTouY00/Auto_proxy/main/Long_term_subscription_num'
   - 'https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge_yaml.yml'
   - 'https://raw.githubusercontent.com/Misaka-blog/chromego_merge/main/sub/merged_proxies_new.yaml'
+
+# 可选：高级订阅选项，为特定来源比如付费订阅配置独立策略。
+# priority 越大越先检测；它不会修改节点名称。priority 相同的源保持原有顺序。
+# count_toward_success_limit 省略时默认 true；设为 false 时，成功节点仍可导出，但不用于触发全局成功数上限。
+# name_prefix / name_suffix 输出时节点名的前缀或后缀，只控制导出显示名称，不参与排序或限额。
+# retry_on_fail 覆盖全局重试次数；0 表示不重试，未设置则沿用全局值。
+# keep_on_dead 将测活失败或无法创建检测客户端的节点也保留在 all/mihomo 输出中；失败节点不会进入历史成功列表。
+# skip_speedtest 只跳过测速，节点仍要先通过测活和地区筛选。
+# bypass_dedupe 保留此来源内及与其他来源重复的节点。
+# allow_countries 额外限制此来源可接受的国家/地区；仍会遵守全局 node-loc 设置。
+# group_output 会在配置的输出目录/sub 下生成独立 YAML 文件，文件名会自动安全化。
+advanced-sub-urls:
+  # - url: 'https://example.com/sub.yaml'
+  #   source_name: 'Example'
+  #   priority: 10
+  #   count_toward_success_limit: true
+  #   name_prefix: '[Example] '
+  #   name_suffix: ''
+  #   keep_on_dead: true
+  #   skip_speedtest: false
+  #   retry_on_fail: 2
+  #   bypass_dedupe: true
+  #   allow_countries: [US, JP, SG]
+  #   group_output: 'example'

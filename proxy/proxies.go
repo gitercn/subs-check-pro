@@ -4,6 +4,8 @@ package proxies
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -44,6 +46,27 @@ var (
 	// totalRawHits 统计「层 1」：解析阶段产出的全部候选节点数。
 	totalRawHits atomic.Int64
 )
+
+type subscriptionSource struct {
+	URL         string
+	Policy      config.SourcePolicy
+	RetryOnFail *int
+}
+
+type proxyNodeEntry struct {
+	Data  map[string]any
+	Level int
+}
+
+const sourcePolicyField = "_source_policy"
+
+// SourcePolicyFromNode returns internal source metadata attached during parsing.
+func SourcePolicyFromNode(node map[string]any) config.SourcePolicy {
+	if policy, ok := node[sourcePolicyField].(config.SourcePolicy); ok {
+		return policy
+	}
+	return config.SourcePolicy{CountTowardSuccessLimit: true}
+}
 
 // logSubscriptionStats 打印订阅数量统计
 func logSubscriptionStats(total, local, remote, history int) {
@@ -147,8 +170,8 @@ func GetProxies(progressCallback func(stepName string, done, total, available in
 	initEnvironment()
 
 	// 获取远程订阅列表
-	subUrls, localNum, remoteNum, historyNum := resolveSubUrls(progressCallback)
-	logSubscriptionStats(len(subUrls), localNum, remoteNum, historyNum)
+	sources, localNum, remoteNum, historyNum := resolveSubUrls(progressCallback)
+	logSubscriptionStats(len(sources), localNum, remoteNum, historyNum)
 
 	// 定义优先级常量
 	const (
@@ -186,14 +209,8 @@ func GetProxies(progressCallback func(stepName string, done, total, available in
 	chanBuf := concurrency
 	proxyChan := make(chan []map[string]any, chanBuf)
 
-	// 定义单一结构体保存节点与层级，合并去重 Map，提升内存局部性和寻址效率
-	type NodeEntry struct {
-		Data  map[string]any
-		Level int
-	}
-
 	// 预分配200K减少rehash；实际unique数通常远小于raw数
-	uniqueMap := make(map[string]NodeEntry, 100000)
+	uniqueMap := make(map[string]proxyNodeEntry, 100000)
 
 	var (
 		rawCount       int
@@ -245,9 +262,12 @@ func GetProxies(progressCallback func(stepName string, done, total, available in
 					continue
 				}
 
-				// 单次 Map 寻址即完成检查和覆盖
-				if existing, exists := uniqueMap[key]; !exists || level > existing.Level {
-					uniqueMap[key] = NodeEntry{
+				// Keep-level first preserves known-good/history nodes. For otherwise
+				// equivalent duplicates, prefer the configured source priority and
+				// then a stable source ID so concurrent fetch timing cannot decide
+				// which source policy the node inherits.
+				if existing, exists := uniqueMap[key]; !exists || shouldReplaceNode(existing, proxy, level) {
+					uniqueMap[key] = proxyNodeEntry{
 						Data:  proxy,
 						Level: level,
 					}
@@ -265,24 +285,24 @@ func GetProxies(progressCallback func(stepName string, done, total, available in
 	var fetchedCount atomic.Int32
 	var validSubsCount atomic.Int32
 	if progressCallback != nil {
-		progressCallback("获取订阅", 0, len(subUrls), 0)
+		progressCallback("获取订阅", 0, len(sources), 0)
 	}
 
-	for _, subURL := range subUrls {
+	for _, source := range sources {
 		wg.Add(1)
 		sem <- struct{}{}
-		isSucced, isHistory, tag := identifyLocalSubType(subURL, listenPort, subStorePort)
-		go func(u, t string, succ, hist bool) {
+		isSucced, isHistory, tag := identifyLocalSubType(source.URL, listenPort, subStorePort)
+		go func(source subscriptionSource, t string, succ, hist bool) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			hasValid := processSubscription(u, t, succ, hist, proxyChan, batchSize)
+			hasValid := processSubscription(source, t, succ, hist, proxyChan, batchSize)
 			if hasValid {
 				validSubsCount.Add(1)
 			}
 			if progressCallback != nil {
-				progressCallback("解析订阅列表", int(fetchedCount.Add(1)), len(subUrls), int(validSubsCount.Load()))
+				progressCallback("解析订阅列表", int(fetchedCount.Add(1)), len(sources), int(validSubsCount.Load()))
 			}
-		}(subURL, tag, isSucced, isHistory)
+		}(source, tag, isSucced, isHistory)
 	}
 
 	wg.Wait()
@@ -331,16 +351,47 @@ func GetProxies(progressCallback func(stepName string, done, total, available in
 	return finalProxies, rawCount, finalSuccCount, finalHistCount, nil
 }
 
+func shouldReplaceNode(existing proxyNodeEntry, candidate map[string]any, candidateLevel int) bool {
+	if candidateLevel != existing.Level {
+		return candidateLevel > existing.Level
+	}
+
+	currentSource := SourcePolicyFromNode(existing.Data)
+	candidateSource := SourcePolicyFromNode(candidate)
+	if candidateSource.Priority != currentSource.Priority {
+		return candidateSource.Priority > currentSource.Priority
+	}
+	if (candidateSource.ID != "") != (currentSource.ID != "") {
+		return candidateSource.ID != ""
+	}
+	if candidateSource.ID != "" && currentSource.ID != "" {
+		return candidateSource.ID < currentSource.ID
+	}
+	return false
+}
+
 // resolveSubUrls 合并本地与远程订阅清单并去重
-func resolveSubUrls(progressCallback func(stepName string, done, total, available int)) ([]string, int, int, int) {
+func resolveSubUrls(progressCallback func(stepName string, done, total, available int)) ([]subscriptionSource, int, int, int) {
 	// 初始化内存限制
 	initMemory()
 
 	var localNum, remoteNum, historyNum int
-	localNum = len(config.GlobalConfig.SubUrls)
+	localNum = len(config.GlobalConfig.SubUrls) + len(config.GlobalConfig.AdvancedSubUrls)
 
-	urls := make([]string, 0, len(config.GlobalConfig.SubUrls))
-	urls = append(urls, config.GlobalConfig.SubUrls...)
+	urls := make([]subscriptionSource, 0, localNum)
+	for _, rawURL := range config.GlobalConfig.SubUrls {
+		urls = append(urls, subscriptionSource{URL: rawURL, Policy: config.SourcePolicy{CountTowardSuccessLimit: true}})
+	}
+	for _, advanced := range config.GlobalConfig.AdvancedSubUrls {
+		rawURL := strings.TrimSpace(advanced.URL)
+		if rawURL == "" {
+			slog.Warn("忽略空的高级订阅源")
+			continue
+		}
+		sum := sha256.Sum256([]byte(strings.TrimSpace(rawURL)))
+		policy := advanced.Policy(hex.EncodeToString(sum[:8]))
+		urls = append(urls, subscriptionSource{URL: rawURL, Policy: policy, RetryOnFail: advanced.RetryOnFail})
+	}
 
 	if len(config.GlobalConfig.SubUrlsRemote) != 0 {
 		slog.Info("拉取远程订阅列表")
@@ -360,7 +411,9 @@ func resolveSubUrls(progressCallback func(stepName string, done, total, availabl
 			} else {
 				valid++
 				remoteNum += len(remote)
-				urls = append(urls, remote...)
+				for _, rawURL := range remote {
+					urls = append(urls, subscriptionSource{URL: rawURL, Policy: config.SourcePolicy{CountTowardSuccessLimit: true}})
+				}
 			}
 			fetched++
 			if progressCallback != nil {
@@ -388,20 +441,20 @@ func resolveSubUrls(progressCallback func(stepName string, done, total, availabl
 
 			if _, err := os.Stat(localLastSuccedFile); err == nil {
 				historyNum++
-				urls = append([]string{localLastSucced + "#Succeed"}, urls...)
+				urls = append([]subscriptionSource{{URL: localLastSucced + "#Succeed", Policy: config.SourcePolicy{CountTowardSuccessLimit: true}}}, urls...)
 			}
 			if _, err := os.Stat(localHistoryFile); err == nil {
 				historyNum++
-				urls = append([]string{localHistory + "#History"}, urls...)
+				urls = append([]subscriptionSource{{URL: localHistory + "#History", Policy: config.SourcePolicy{CountTowardSuccessLimit: true}}}, urls...)
 			}
 		}
 	}
 
 	// 去重并过滤本地 URL（忽略 fragment）
-	seen := make(map[string]struct{}, len(urls))
-	out := make([]string, 0, len(urls))
-	for _, s := range urls {
-		s = strings.TrimSpace(s)
+	seen := make(map[string]int, len(urls))
+	out := make([]subscriptionSource, 0, len(urls))
+	for _, source := range urls {
+		s := strings.TrimSpace(source.URL)
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
@@ -418,11 +471,16 @@ func resolveSubUrls(progressCallback func(stepName string, done, total, availabl
 			}
 		}
 
-		if _, ok := seen[key]; ok {
+		if existingIndex, ok := seen[key]; ok {
+			// Explicit advanced-source settings override a plain URL entry.
+			if source.Policy.ID != "" {
+				out[existingIndex] = source
+			}
 			continue
 		}
-		seen[key] = struct{}{}
-		out = append(out, s)
+		seen[key] = len(out)
+		source.URL = s
+		out = append(out, source)
 	}
 	return out, localNum, remoteNum, historyNum
 }
@@ -504,12 +562,13 @@ const defaultParseBatchSize = 1000
 // 完整节点切片；产出的节点在本地攒到 batchSize 后才整批发往 proxyChan，
 // 在"内存峰值"与"channel 调度开销"之间取折中（见 defaultParseBatchSize 注释）。
 func processSubscription(
-	urlStr, tag string,
+	source subscriptionSource, tag string,
 	wasSucced, wasHistory bool,
 	out chan<- []map[string]any,
 	batchSize int, // 由 GetProxies 传入，统一管理
 ) bool {
-	data, err := FetchSubsData(urlStr)
+	urlStr := source.URL
+	data, err := FetchSubsDataWithRetry(urlStr, source.RetryOnFail)
 	if err != nil {
 		if !errors.Is(err, ErrIgnore) {
 			logFatal(err, urlStr)
@@ -588,10 +647,16 @@ func processSubscription(
 
 		// 订阅内去重（减少对全局 map 和 channel 的压力）
 		key := utils.NodeKey(node)
-		if _, dup := seenInSub[key]; dup {
-			return true
+		if !source.Policy.BypassDedupe {
+			if _, dup := seenInSub[key]; dup {
+				return true
+			}
+			seenInSub[key] = struct{}{}
+		} else {
+			// Opting out of deduplication retains this source's duplicate entries,
+			// while ordinary sources continue to use the shared fingerprint.
+			key += "\x00source:" + source.Policy.ID + ":" + strconv.Itoa(validCount)
 		}
-		seenInSub[key] = struct{}{}
 
 		// 将计算好的 key 存入节点传递给消费者，免去下游消费时的二次高负载计算
 		node["_node_key"] = key
@@ -600,6 +665,7 @@ func processSubscription(
 		node["sub_tag"] = tag
 		node["sub_was_succeed"] = wasSucced
 		node["sub_from_history"] = wasHistory
+		node[sourcePolicyField] = source.Policy
 
 		batch = append(batch, node)
 		validCount++
@@ -609,10 +675,10 @@ func processSubscription(
 		return true
 	}
 
-	parseStats, streamErr := parse.ParseSubscriptionDataStream(data, urlStr, handle)
+	parseStats, streamErr := parse.ParseSubscriptionDataStreamWithOptions(data, urlStr, !source.Policy.BypassDedupe, handle)
 	if streamErr != nil {
 		// 兜底：正则提取，通常节点量极少，无需流式
-		for _, node := range parse.FallbackExtractV2Ray(data, urlStr) {
+		for _, node := range parse.FallbackExtractV2RayWithOptions(data, urlStr, !source.Policy.BypassDedupe) {
 			handle(node)
 		}
 	}

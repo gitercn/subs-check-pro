@@ -2,6 +2,8 @@
 package save
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 // ProxyCategory 定义代理分类
 type ProxyCategory struct {
 	Name    string
+	Format  string
 	Proxies []map[string]any
 	Filter  func(result check.Result) bool
 }
@@ -59,7 +63,7 @@ var localClient = &http.Client{
 
 // NewConfigSaver 创建新的配置保存器，支持显式指定保存方法
 func NewConfigSaver(results []check.Result, saveMethodName string) *ConfigSaver {
-	return &ConfigSaver{
+	cs := &ConfigSaver{
 		methodName: saveMethodName,
 		results:    results,
 		saveMethod: getSaverFunc(saveMethodName),
@@ -67,9 +71,37 @@ func NewConfigSaver(results []check.Result, saveMethodName string) *ConfigSaver 
 			{Name: "all.yaml", Proxies: nil, Filter: func(r check.Result) bool { return true }},
 			{Name: "mihomo.yaml", Proxies: nil, Filter: func(r check.Result) bool { return true }},
 			{Name: "base64.txt", Proxies: nil, Filter: func(r check.Result) bool { return true }},
-			{Name: "history.yaml", Proxies: nil, Filter: func(r check.Result) bool { return true }},
+			// History tracks previously usable nodes; a KeepOnDead export should
+			// not silently turn failed nodes into trusted history entries.
+			{Name: "history.yaml", Proxies: nil, Filter: func(r check.Result) bool { return r.Available }},
 		},
 	}
+
+	// Build one safe, deterministic export file for each configured source group.
+	groups := make(map[string]struct{})
+	for _, r := range results {
+		if group := strings.TrimSpace(r.Source.GroupOutput); group != "" {
+			groups[group] = struct{}{}
+		}
+	}
+
+	groupNames := make([]string, 0, len(groups))
+	for group := range groups {
+		groupNames = append(groupNames, group)
+	}
+	sort.Strings(groupNames)
+	for _, groupName := range groupNames {
+		cs.categories = append(cs.categories, ProxyCategory{
+			Name:    sourceGroupFilename(groupName),
+			Format:  "proxy-list",
+			Proxies: nil,
+			Filter: func(r check.Result) bool {
+				return strings.TrimSpace(r.Source.GroupOutput) == groupName
+			},
+		})
+	}
+
+	return cs
 }
 
 // SaveConfig 保存配置的入口函数
@@ -132,6 +164,9 @@ func (cs *ConfigSaver) categorizeProxies() {
 
 // generateContent 根据文件类型生成对应的字节数据
 func (cs *ConfigSaver) generateContent(category ProxyCategory) ([]byte, error) {
+	if category.Format == "proxy-list" {
+		return yaml.Marshal(map[string]any{"proxies": cleanExportProxies(category.Proxies)})
+	}
 	switch category.Name {
 	case "history.yaml":
 		return cs.generateHistory(category.Proxies)
@@ -144,6 +179,41 @@ func (cs *ConfigSaver) generateContent(category ProxyCategory) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("未知的文件类型: %s", category.Name)
 	}
+}
+
+func sourceGroupFilename(group string) string {
+	var slug strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(group)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			slug.WriteRune(r)
+			lastDash = false
+		} else if !lastDash && slug.Len() > 0 {
+			slug.WriteByte('-')
+			lastDash = true
+		}
+	}
+	name := strings.Trim(slug.String(), "-_")
+	if name == "" {
+		name = "source"
+	}
+	sum := sha256.Sum256([]byte(group))
+	return fmt.Sprintf("group-%s-%s.yaml", name, hex.EncodeToString(sum[:4]))
+}
+
+func cleanExportProxies(proxies []map[string]any) []map[string]any {
+	cleaned := make([]map[string]any, 0, len(proxies))
+	for _, proxy := range proxies {
+		copy := make(map[string]any, len(proxy))
+		for key, value := range proxy {
+			if strings.HasPrefix(key, "_") || strings.HasPrefix(key, "sub_") {
+				continue
+			}
+			copy[key] = value
+		}
+		cleaned = append(cleaned, copy)
+	}
+	return cleaned
 }
 
 func (cs *ConfigSaver) generateHistory(newProxies []map[string]any) ([]byte, error) {

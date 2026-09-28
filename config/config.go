@@ -47,44 +47,110 @@ type SubProcessConfig struct {
 	SubInfo bool `yaml:"sub-info"`
 }
 
+type AdvancedSubUrlConfig struct {
+	URL                     string   `yaml:"url"`
+	SourceName              string   `yaml:"source_name"`
+	Tag                     string   `yaml:"tag,omitempty"` // Deprecated alias for source_name.
+	Priority                int      `yaml:"priority"`
+	PriorityFetch           bool     `yaml:"priority_fetch,omitempty"` // Deprecated alias for priority > 0.
+	CountTowardSuccessLimit *bool    `yaml:"count_toward_success_limit"`
+	NamePrefix              string   `yaml:"name_prefix"`
+	NameSuffix              string   `yaml:"name_suffix"`
+	KeepOnDead              bool     `yaml:"keep_on_dead"`
+	SkipSpeedtest           bool     `yaml:"skip_speedtest"`
+	RetryOnFail             *int     `yaml:"retry_on_fail"`
+	BypassDedupe            bool     `yaml:"bypass_dedupe"`
+	AllowCountries          []string `yaml:"allow_countries"`
+	GroupOutput             string   `yaml:"group_output"`
+}
+
+// SourcePolicy is runtime-only metadata. It controls processing but is never
+// emitted as a Mihomo proxy field.
+type SourcePolicy struct {
+	ID                      string   `json:"id,omitempty" yaml:"-"`
+	Name                    string   `json:"name,omitempty" yaml:"-"`
+	Priority                int      `json:"priority,omitempty" yaml:"-"`
+	CountTowardSuccessLimit bool     `json:"count_toward_success_limit" yaml:"-"`
+	NamePrefix              string   `json:"name_prefix,omitempty" yaml:"-"`
+	NameSuffix              string   `json:"name_suffix,omitempty" yaml:"-"`
+	KeepOnDead              bool     `json:"keep_on_dead,omitempty" yaml:"-"`
+	SkipSpeedtest           bool     `json:"skip_speedtest,omitempty" yaml:"-"`
+	BypassDedupe            bool     `json:"bypass_dedupe,omitempty" yaml:"-"`
+	AllowCountries          []string `json:"allow_countries,omitempty" yaml:"-"`
+	GroupOutput             string   `json:"group_output,omitempty" yaml:"-"`
+}
+
+func (s AdvancedSubUrlConfig) Policy(id string) SourcePolicy {
+	countTowardLimit := true
+	if s.CountTowardSuccessLimit != nil {
+		countTowardLimit = *s.CountTowardSuccessLimit
+	}
+	priority := s.Priority
+	if s.PriorityFetch && priority <= 0 {
+		priority = 1
+	}
+	name := s.SourceName
+	if name == "" {
+		name = s.Tag
+	}
+	suffix := s.NameSuffix
+	if suffix == "" && s.Tag != "" {
+		suffix = " #" + s.Tag // Legacy tag remains display-only.
+	}
+	return SourcePolicy{
+		ID:                      id,
+		Name:                    name,
+		Priority:                priority,
+		CountTowardSuccessLimit: countTowardLimit,
+		NamePrefix:              s.NamePrefix,
+		NameSuffix:              suffix,
+		KeepOnDead:              s.KeepOnDead,
+		SkipSpeedtest:           s.SkipSpeedtest,
+		BypassDedupe:            s.BypassDedupe,
+		AllowCountries:          append([]string(nil), s.AllowCountries...),
+		GroupOutput:             s.GroupOutput,
+	}
+}
+
 type Config struct {
-	PrintProgress        bool    `yaml:"print-progress"`
-	ProgressMode         string  `yaml:"progress-mode"`
-	Concurrent           int     `yaml:"concurrent"`
-	AliveConcurrent      int     `yaml:"alive-concurrent"`
-	SpeedConcurrent      int     `yaml:"speed-concurrent"`
-	MediaConcurrent      int     `yaml:"media-concurrent"`
-	EnableIPv6           bool    `yaml:"ipv6"`
-	CheckInterval        int     `yaml:"check-interval"`
-	CronExpression       string  `yaml:"cron-expression"`
-	Timeout              int     `yaml:"timeout"`
-	SpeedTestURL         string  `yaml:"speed-test-url"`
-	DownloadTimeout      int     `yaml:"download-timeout"`
-	DownloadMB           int     `yaml:"download-mb"`
-	TotalSpeedLimit      int     `yaml:"total-speed-limit"`
-	Threshold            float32 `yaml:"threshold"`
-	GCThreshold          int64   `yaml:"gc-threshold"`
-	MinSpeed             int     `yaml:"min-speed"`
-	MediaCheckTimeout    int     `yaml:"media-check-timeout"`
-	FilterRegex          string  `yaml:"filter-regex"`
-	SaveMethod           string  `yaml:"save-method"`
-	WebDAVURL            string  `yaml:"webdav-url"`
-	WebDAVUsername       string  `yaml:"webdav-username"`
-	WebDAVPassword       string  `yaml:"webdav-password"`
-	GithubToken          string  `yaml:"github-token"`
-	GithubGistID         string  `yaml:"github-gist-id"`
-	GithubAPIMirror      string  `yaml:"github-api-mirror"`
-	WorkerURL            string  `yaml:"worker-url"`
-	WorkerToken          string  `yaml:"worker-token"`
-	S3Endpoint           string  `yaml:"s3-endpoint"`
-	S3AccessID           string  `yaml:"s3-access-id"`
-	S3SecretKey          string  `yaml:"s3-secret-key"`
-	S3Bucket             string  `yaml:"s3-bucket"`
-	S3UseSSL             bool    `yaml:"s3-use-ssl"`
-	S3BucketLookup       string  `yaml:"s3-bucket-lookup"`
-	SubUrlsReTry         int     `yaml:"sub-urls-retry"`
-	SubUrlsRetryInterval int     `yaml:"sub-urls-retry-interval"`
-	SubUrlsTimeout       int     `yaml:"sub-urls-timeout"`
+	AdvancedSubUrls      []AdvancedSubUrlConfig `yaml:"advanced-sub-urls"`
+	PrintProgress        bool                   `yaml:"print-progress"`
+	ProgressMode         string                 `yaml:"progress-mode"`
+	Concurrent           int                    `yaml:"concurrent"`
+	AliveConcurrent      int                    `yaml:"alive-concurrent"`
+	SpeedConcurrent      int                    `yaml:"speed-concurrent"`
+	MediaConcurrent      int                    `yaml:"media-concurrent"`
+	EnableIPv6           bool                   `yaml:"ipv6"`
+	CheckInterval        int                    `yaml:"check-interval"`
+	CronExpression       string                 `yaml:"cron-expression"`
+	Timeout              int                    `yaml:"timeout"`
+	SpeedTestURL         string                 `yaml:"speed-test-url"`
+	DownloadTimeout      int                    `yaml:"download-timeout"`
+	DownloadMB           int                    `yaml:"download-mb"`
+	TotalSpeedLimit      int                    `yaml:"total-speed-limit"`
+	Threshold            float32                `yaml:"threshold"`
+	GCThreshold          int64                  `yaml:"gc-threshold"`
+	MinSpeed             int                    `yaml:"min-speed"`
+	MediaCheckTimeout    int                    `yaml:"media-check-timeout"`
+	FilterRegex          string                 `yaml:"filter-regex"`
+	SaveMethod           string                 `yaml:"save-method"`
+	WebDAVURL            string                 `yaml:"webdav-url"`
+	WebDAVUsername       string                 `yaml:"webdav-username"`
+	WebDAVPassword       string                 `yaml:"webdav-password"`
+	GithubToken          string                 `yaml:"github-token"`
+	GithubGistID         string                 `yaml:"github-gist-id"`
+	GithubAPIMirror      string                 `yaml:"github-api-mirror"`
+	WorkerURL            string                 `yaml:"worker-url"`
+	WorkerToken          string                 `yaml:"worker-token"`
+	S3Endpoint           string                 `yaml:"s3-endpoint"`
+	S3AccessID           string                 `yaml:"s3-access-id"`
+	S3SecretKey          string                 `yaml:"s3-secret-key"`
+	S3Bucket             string                 `yaml:"s3-bucket"`
+	S3UseSSL             bool                   `yaml:"s3-use-ssl"`
+	S3BucketLookup       string                 `yaml:"s3-bucket-lookup"`
+	SubUrlsReTry         int                    `yaml:"sub-urls-retry"`
+	SubUrlsRetryInterval int                    `yaml:"sub-urls-retry-interval"`
+	SubUrlsTimeout       int                    `yaml:"sub-urls-timeout"`
 
 	// SubsParseBatch 每批次发往去重队列的节点数
 	// 生产者攒够该数量后整批发送，消费者逐批接收处理。
@@ -167,6 +233,7 @@ type Config struct {
 	DropBadCfNodes        bool     `yaml:"drop-bad-cf-nodes"`
 	EnhancedTag           bool     `yaml:"enhanced-tag"`
 	SuccessLimit          int32    `yaml:"success-limit"`
+	MaxTotalTested        int      `yaml:"max-total-tested"`
 	NodePrefix            string   `yaml:"node-prefix"`
 	NodeType              []string `yaml:"node-type"`
 	NodeLoc               []string `yaml:"node-loc"`

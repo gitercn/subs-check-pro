@@ -21,6 +21,17 @@ func ParseSubscriptionDataStream(
 	subURL string,
 	yield func(map[string]any) bool,
 ) (map[string]int, error) {
+	return ParseSubscriptionDataStreamWithOptions(data, subURL, true, yield)
+}
+
+// ParseSubscriptionDataStreamWithOptions allows a source to preserve duplicate
+// entries while retaining the same streaming parser and validation behavior.
+func ParseSubscriptionDataStreamWithOptions(
+	data []byte,
+	subURL string,
+	deduplicate bool,
+	yield func(map[string]any) bool,
+) (map[string]int, error) {
 	stats := make(map[string]int, 6)
 
 	drain := func(nodes []map[string]any, key string) bool {
@@ -84,7 +95,7 @@ func ParseSubscriptionDataStream(
 						strList = append(strList, s)
 					}
 				}
-				nodes, d := ParseProxyLinksAndConvert(strList, subURL)
+				nodes, d := ParseProxyLinksAndConvertWithOptions(strList, subURL, deduplicate)
 				stats["BatchDedup"] += d // ← 批次去重数汇入 stats
 				drain(nodes, "StringList")
 				return stats, nil
@@ -109,12 +120,14 @@ func ParseSubscriptionDataStream(
 			if n == nil {
 				continue
 			}
-			k := utils.NodeKey(n)
-			if _, dup := lineSeen[k]; dup {
-				lineDeduped++
-				continue
+			if deduplicate {
+				k := utils.NodeKey(n)
+				if _, dup := lineSeen[k]; dup {
+					lineDeduped++
+					continue
+				}
+				lineSeen[k] = struct{}{}
 			}
-			lineSeen[k] = struct{}{}
 			if !yield(n) {
 				return false
 			}
@@ -133,7 +146,7 @@ func ParseSubscriptionDataStream(
 			return stats, nil
 		}
 	}
-	if nodes, d := parseRawLines(data, subURL); len(nodes) > 0 {
+	if nodes, d := parseRawLines(data, subURL, deduplicate); len(nodes) > 0 {
 		anyHit = true
 		stats["BatchDedup"] += d // ← parseRawLines 内部批次去重数
 		if !drainLine(nodes, "RawLines") {

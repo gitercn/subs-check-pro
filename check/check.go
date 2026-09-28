@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +68,8 @@ const MediaCheckMaxRetries = 3
 // Result 存储节点检测结果
 type Result struct {
 	Proxy          map[string]any
+	Source         config.SourcePolicy `json:"source,omitempty"`
+	Available      bool                `json:"-"`
 	Openai         bool
 	OpenaiWeb      bool
 	Copilot        bool
@@ -88,11 +91,12 @@ type Result struct {
 
 // ProxyChecker 处理代理检测的主要结构体
 type ProxyChecker struct {
-	results     []Result
-	resultChan  chan Result
-	proxyCount  int
-	threadCount int
-	available   atomic.Int32
+	results          []Result
+	resultChan       chan Result
+	proxyCount       int
+	threadCount      int
+	available        atomic.Int32
+	countedAvailable atomic.Int32
 
 	aliveConcurrent int
 	speedConcurrent int
@@ -109,6 +113,7 @@ type ProxyChecker struct {
 type ProxyJob struct {
 	Client *ProxyClient
 	Result Result
+	Source config.SourcePolicy
 
 	CfLoc string
 	CfIP  string
@@ -264,6 +269,9 @@ func Check() ([]Result, error) {
 	Progress.Store(0)
 	ProxyCount.Store(0)
 
+	// Per-run counters distinguish all usable nodes from nodes that participate
+	// in the configured early-stop limit.
+
 	if subWasSuccedLength > 0 {
 		slog.Info("已加载上次检测可用节点", "数量", subWasSuccedLength)
 	}
@@ -305,6 +313,11 @@ func Check() ([]Result, error) {
 		// 动态输出到终端日志
 		slog.Info(fmt.Sprintf("节点乱序, 相同 CIDR %s 或 %s 最小间距: %d", cidr, domainLevel, cfg.MinSpacing))
 	}
+
+	// Apply source priority after the normal shuffle. Names remain presentation-only.
+	sort.SliceStable(proxies, func(i, j int) bool {
+		return proxyutils.SourcePolicyFromNode(proxies[i]).Priority > proxyutils.SourcePolicyFromNode(proxies[j]).Priority
+	})
 
 	CurrentStepName.Store("获取订阅完成")
 	if len(proxies) == 0 {
@@ -485,8 +498,15 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	CurrentStepName.Store("进度")
 
 	// 启动流水线阶段
+	// 初始化结果通道后再启动分发器，确保客户端创建失败时的 KeepOnDead
+	// 结果发送不会在 nil channel 上永久阻塞。
+	resultLength := pc.mediaConcurrent
+	if config.GlobalConfig.SuccessLimit > 0 {
+		resultLength = int(config.GlobalConfig.SuccessLimit)
+	}
+	pc.resultChan = make(chan Result, resultLength)
 	go pc.distributeJobs(proxies, ctx)
-	go pc.runAliveStage(ctx, geoDB)
+	go pc.runAliveStage(ctx, cancel, geoDB)
 	go pc.runSpeedStage(ctx, cancel)
 	pc.runMediaStageAndCollect(geoDB, ctx, cancel)
 	CurrentStepName.Store("处理结果")
@@ -494,7 +514,7 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	// 确保进度显示到 100%
 	pc.pt.Finalize()
 
-	if config.GlobalConfig.SuccessLimit > 0 && pc.available.Load() >= config.GlobalConfig.SuccessLimit {
+	if config.GlobalConfig.SuccessLimit > 0 && pc.countedAvailable.Load() >= config.GlobalConfig.SuccessLimit {
 		slog.Info(fmt.Sprintf("达到成功节点数量限制 %d, 收集结果完成。", config.GlobalConfig.SuccessLimit))
 	}
 
@@ -504,7 +524,7 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	// 重置预计剩余时间计算
 	ETASeconds.Store(0)
 
-	slog.Info(fmt.Sprintf("可用节点数量: %d", len(pc.results)))
+	slog.Info("可用节点数量", "count", pc.available.Load(), "保留结果数", len(pc.results))
 	CheckTrafficTotal = utils.FormatTraffic(TotalBytes.Load())
 	slog.Info(fmt.Sprintf("检测消耗流量: %s", CheckTrafficTotal))
 	slog.Debug("流量", "UP", UP.Load(), "DOWN", DOWN.Load())
@@ -550,6 +570,7 @@ func (pc *ProxyChecker) distributeJobs(proxies []map[string]any, ctx context.Con
 	// 使用原子索引来分发任务
 	var proxyIndex atomic.Int64
 	proxyIndex.Store(-1) // 初始化为 -1
+	var maxTestLimitLogged atomic.Bool
 
 	// 定义主动 GC 的阈值
 	var gcThreshold = config.GlobalConfig.GCThreshold
@@ -565,6 +586,12 @@ func (pc *ProxyChecker) distributeJobs(proxies []map[string]any, ctx context.Con
 				index := proxyIndex.Add(1)
 				if index >= int64(len(proxies)) {
 					return // 所有代理都已处理完毕
+				}
+				if limit := config.GlobalConfig.MaxTotalTested; limit > 0 && index >= int64(limit) {
+					if maxTestLimitLogged.CompareAndSwap(false, true) {
+						slog.Info("达到单轮检测节点上限", "limit", limit)
+					}
+					return
 				}
 
 				if checkCtxDone(ctx) {
@@ -587,16 +614,23 @@ func (pc *ProxyChecker) distributeJobs(proxies []map[string]any, ctx context.Con
 					}(index)
 				}
 
-				cli := CreateClient(mapping)
+				source := proxyutils.SourcePolicyFromNode(mapping)
+				cli := CreateClient(proxyConfigForRuntime(mapping))
 				if cli == nil {
 					// 创建失败：视为 alive 完成（失败），不进入 speed/media
 					pc.pt.CountAlive(false)
+					if source.KeepOnDead {
+						deadResult := Result{Proxy: mapping, Source: source}
+						applySourceName(&deadResult, source)
+						pc.resultChan <- deadResult
+					}
 					continue
 				}
 
 				job := &ProxyJob{
 					Client: cli,
-					Result: Result{Proxy: mapping},
+					Result: Result{Proxy: mapping, Source: source},
+					Source: source,
 				}
 				job.NeedCF = config.GlobalConfig.DropBadCfNodes ||
 					(config.GlobalConfig.MediaCheck && needsCF(config.GlobalConfig.Platforms))
@@ -619,7 +653,7 @@ func (pc *ProxyChecker) distributeJobs(proxies []map[string]any, ctx context.Con
 }
 
 // 测活
-func (pc *ProxyChecker) runAliveStage(ctx context.Context, db *maxminddb.Reader) {
+func (pc *ProxyChecker) runAliveStage(ctx context.Context, cancel context.CancelFunc, db *maxminddb.Reader) {
 	// 根据是否启用测速，延迟关闭下一个阶段的通道。
 	if speedON {
 		defer close(pc.speedChan)
@@ -650,6 +684,10 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, db *maxminddb.Reader)
 					if job.aliveMarked.CompareAndSwap(false, true) {
 						pc.pt.CountAlive(false)
 					}
+					if job.Source.KeepOnDead {
+						applySourceName(&job.Result, job.Source)
+						pc.resultChan <- job.Result
+					}
 					job.Close()
 					continue // 不进入 speed/media
 				}
@@ -669,6 +707,9 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, db *maxminddb.Reader)
 
 				// 地区过滤
 				if !job.checkJobLocation(db, ctx) {
+					if job.aliveMarked.CompareAndSwap(false, true) {
+						pc.pt.CountAlive(false)
+					}
 					job.Close()
 					continue
 				}
@@ -680,16 +721,28 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, db *maxminddb.Reader)
 
 				// 流转
 				if speedON {
-					select {
-					case pc.speedChan <- job:
-
-					case <-ctx.Done():
-						job.Close()
+					if job.Source.SkipSpeedtest {
+						if job.speedMarked.CompareAndSwap(false, true) {
+							pc.pt.CountSpeed(true)
+							pc.incrementAvailable(job.Source)
+							if config.GlobalConfig.SuccessLimit > 0 &&
+								pc.countedAvailable.Load() >= config.GlobalConfig.SuccessLimit {
+								Successlimited.Store(true)
+								cancel()
+							}
+						}
+						pc.mediaChan <- job
+					} else {
+						select {
+						case pc.speedChan <- job:
+						case <-ctx.Done():
+							job.Close()
+						}
 					}
 				} else {
 					// 无测速时：通过 alive 即可视为“可用”，确保 Available 与最终可用数量一致
 					if job.speedMarked.CompareAndSwap(false, true) {
-						pc.incrementAvailable()
+						pc.incrementAvailable(job.Source)
 					}
 					select {
 					case pc.mediaChan <- job:
@@ -736,7 +789,7 @@ func (pc *ProxyChecker) runSpeedStage(ctx context.Context, cancel context.Cancel
 					pc.pt.CountSpeed(success)
 					// 仅在测速成功时计入可用数量
 					if success {
-						pc.incrementAvailable()
+						pc.incrementAvailable(job.Source)
 					}
 				}
 				if !success {
@@ -745,7 +798,7 @@ func (pc *ProxyChecker) runSpeedStage(ctx context.Context, cancel context.Cancel
 				}
 				job.Speed = speed
 
-				if config.GlobalConfig.SuccessLimit > 0 && pc.available.Load() >= config.GlobalConfig.SuccessLimit {
+				if config.GlobalConfig.SuccessLimit > 0 && pc.countedAvailable.Load() >= config.GlobalConfig.SuccessLimit {
 					stopOnce.Do(func() {
 						Successlimited.Store(true)
 						var msg string
@@ -789,12 +842,6 @@ func (pc *ProxyChecker) runSpeedStage(ctx context.Context, cancel context.Cancel
 // 流媒体检测 + 收集结果
 func (pc *ProxyChecker) runMediaStageAndCollect(db *maxminddb.Reader, ctx context.Context, cancel context.CancelFunc) {
 	var wg sync.WaitGroup
-	resultLength := pc.mediaConcurrent
-	if config.GlobalConfig.SuccessLimit != 0 {
-		resultLength = int(config.GlobalConfig.SuccessLimit)
-	}
-
-	pc.resultChan = make(chan Result, resultLength)
 
 	// 设置成功数量限制
 	var stopOnce sync.Once
@@ -822,7 +869,7 @@ func (pc *ProxyChecker) runMediaStageAndCollect(db *maxminddb.Reader, ctx contex
 					}
 
 					// 设置成功数量限制
-					if config.GlobalConfig.SuccessLimit > 0 && pc.available.Load() >= config.GlobalConfig.SuccessLimit {
+					if config.GlobalConfig.SuccessLimit > 0 && pc.countedAvailable.Load() >= config.GlobalConfig.SuccessLimit {
 						stopOnce.Do(func() {
 							Successlimited.Store(true)
 							pc.pt.FinishAliveStage()
@@ -848,6 +895,9 @@ func (pc *ProxyChecker) runMediaStageAndCollect(db *maxminddb.Reader, ctx contex
 				pc.updateProxyName(&job.Result, job.Client, job.Speed, db, job.CfLoc, job.CfIP, ctx)
 
 				// 将结果发送到 collector
+				// 只有走完整个测活/测速链路并进入结果阶段的节点才算可用；
+				// KeepOnDead 保留的失败节点会以 Available=false 导出。
+				job.Result.Available = true
 				pc.resultChan <- job.Result
 
 				if job.mediaMarked.CompareAndSwap(false, true) {
@@ -1235,6 +1285,26 @@ func (pc *ProxyChecker) updateProxyName(res *Result, httpClient *ProxyClient, sp
 	}
 
 	res.Proxy["name"] = name
+	applySourceName(res, res.Source)
+}
+
+func applySourceName(result *Result, source config.SourcePolicy) {
+	if result == nil || result.Proxy == nil || (source.NamePrefix == "" && source.NameSuffix == "") {
+		return
+	}
+	name, _ := result.Proxy["name"].(string)
+	result.Proxy["name"] = source.NamePrefix + name + source.NameSuffix
+}
+
+func proxyConfigForRuntime(mapping map[string]any) map[string]any {
+	clean := make(map[string]any, len(mapping))
+	for key, value := range mapping {
+		if strings.HasPrefix(key, "_") || strings.HasPrefix(key, "sub_") {
+			continue
+		}
+		clean[key] = value
+	}
+	return clean
 }
 
 type ProxyClient struct {
@@ -1409,9 +1479,12 @@ func (c *countingConn) Write(b []byte) (int, error) {
 }
 
 // 工具函数
-func (pc *ProxyChecker) incrementAvailable() {
+func (pc *ProxyChecker) incrementAvailable(source config.SourcePolicy) {
 	pc.available.Add(1)
 	Available.Add(1)
+	if source.CountTowardSuccessLimit {
+		pc.countedAvailable.Add(1)
+	}
 }
 
 // checkCtxDone 提供一个非阻塞的检查，判断上下文是否已结束或是否收到强制关闭信号。
@@ -1476,7 +1549,7 @@ func withRetry(ctx context.Context, fn func() error) error {
 // 通过过滤后将归属地信息写入 job.Result，返回 false 表示节点未通过过滤。
 func (job *ProxyJob) checkJobLocation(db *maxminddb.Reader, ctx context.Context) bool {
 	filterLocs := config.GlobalConfig.NodeLoc
-	if len(filterLocs) == 0 {
+	if len(filterLocs) == 0 && len(job.Source.AllowCountries) == 0 {
 		return true
 	}
 
@@ -1494,7 +1567,10 @@ func (job *ProxyJob) checkJobLocation(db *maxminddb.Reader, ctx context.Context)
 		return false
 	}
 
-	if !containsLocation(filterLocs, country) {
+	if len(filterLocs) > 0 && !containsLocation(filterLocs, country) {
+		return false
+	}
+	if len(job.Source.AllowCountries) > 0 && !containsLocation(job.Source.AllowCountries, country) {
 		return false
 	}
 

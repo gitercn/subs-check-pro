@@ -72,7 +72,7 @@ func newAnalysisStats() *AnalysisStats {
 func (pc *ProxyChecker) GenerateAnalysisReport() {
 	// 统计可用节点数量
 	for _, result := range pc.results {
-		if result.Proxy != nil {
+		if result.Proxy != nil && result.Available {
 			if subURL, ok := result.Proxy["sub_url"].(string); ok {
 				stats := proxyutils.SubStats[subURL]
 				stats.Success++
@@ -85,7 +85,7 @@ func (pc *ProxyChecker) GenerateAnalysisReport() {
 	subAnalysis := make(map[string]*AnalysisStats)
 
 	for _, result := range pc.results {
-		if result.Proxy == nil {
+		if result.Proxy == nil || !result.Available {
 			continue
 		}
 
@@ -681,6 +681,7 @@ func (pc *ProxyChecker) CleanupMetadata() {
 		if result.Proxy != nil {
 			delete(result.Proxy, "sub_url")
 			delete(result.Proxy, "sub_tag")
+			delete(result.Proxy, "_source_policy")
 		}
 	}
 }

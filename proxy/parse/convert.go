@@ -322,6 +322,11 @@ func ConvertProtocolMap(con map[string]any) []map[string]any {
 //
 // 返回值：(去重后的节点列表, 批次级别去重掉的节点数量)
 func ParseProxyLinksAndConvert(links []string, subURL string) ([]map[string]any, int) {
+	return ParseProxyLinksAndConvertWithOptions(links, subURL, true)
+}
+
+// ParseProxyLinksAndConvertWithOptions optionally preserves duplicate entries.
+func ParseProxyLinksAndConvertWithOptions(links []string, subURL string, deduplicate bool) ([]map[string]any, int) {
 	var finalNodes []map[string]any
 	var batchLinks []string
 	var directNodes []map[string]any // 用于存放免解析直接组装的节点
@@ -416,7 +421,9 @@ func ParseProxyLinksAndConvert(links []string, subURL string) ([]map[string]any,
 	}
 
 	// 初始化并发去重工具
-	batchLinks = lo.Uniq(batchLinks)
+	if deduplicate {
+		batchLinks = lo.Uniq(batchLinks)
+	}
 	seen := make(map[string]struct{}, len(batchLinks)+len(directNodes))
 	var mu sync.Mutex
 
@@ -424,6 +431,10 @@ func ParseProxyLinksAndConvert(links []string, subURL string) ([]map[string]any,
 		mu.Lock()
 		defer mu.Unlock()
 		for _, n := range nodes {
+			if !deduplicate {
+				finalNodes = append(finalNodes, n)
+				continue
+			}
 			k := utils.NodeKey(n)
 			if _, dup := seen[k]; dup {
 				batchDeduped++

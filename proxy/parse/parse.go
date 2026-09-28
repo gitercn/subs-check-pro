@@ -105,6 +105,18 @@ func ParseSubscriptionData(data []byte, subURL string) ([]map[string]any, error)
 	return parseLineBasedFormats(data, subURL)
 }
 
+// FallbackExtractV2RayWithOptions extracts common links when the streaming
+// parser cannot identify the input format.
+func FallbackExtractV2RayWithOptions(data []byte, subURL string, deduplicate bool) []map[string]any {
+	decodedData := TryDecodeBase64(data)
+	links := ExtractV2RayLinks(decodedData)
+	if len(links) == 0 {
+		return nil
+	}
+	nodes, _ := ParseProxyLinksAndConvertWithOptions(links, subURL, deduplicate)
+	return nodes
+}
+
 // parseLineBasedFormats 处理所有行级格式，收集全部结果后去重合并
 func parseLineBasedFormats(data []byte, subURL string) ([]map[string]any, error) {
 	seen := make(map[string]struct{})
@@ -166,7 +178,7 @@ func parseLineBasedFormats(data []byte, subURL string) ([]map[string]any, error)
 }
 
 // parseRawLines 读取纯文本行并交给统一解析器
-func parseRawLines(data []byte, subURL string) ([]map[string]any, int) {
+func parseRawLines(data []byte, subURL string, deduplicate ...bool) ([]map[string]any, int) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	var lines []string
 	for scanner.Scan() {
@@ -178,7 +190,11 @@ func parseRawLines(data []byte, subURL string) ([]map[string]any, int) {
 	if len(lines) == 0 {
 		return nil, 0
 	}
-	return ParseProxyLinksAndConvert(lines, subURL)
+	shouldDeduplicate := true
+	if len(deduplicate) > 0 {
+		shouldDeduplicate = deduplicate[0]
+	}
+	return ParseProxyLinksAndConvertWithOptions(lines, subURL, shouldDeduplicate)
 }
 
 // FallbackExtractV2Ray 正则提取兜底

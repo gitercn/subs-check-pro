@@ -46,6 +46,12 @@ var clientMapCache sync.Map
 
 // FetchSubsData 获取数据 (包含重试、占位符处理、代理策略)
 func FetchSubsData(rawURL string) ([]byte, error) {
+	return FetchSubsDataWithRetry(rawURL, nil)
+}
+
+// FetchSubsDataWithRetry fetches a subscription using the configured retry
+// count unless retryOverride is supplied. A value of zero means no retries.
+func FetchSubsDataWithRetry(rawURL string, retryOverride *int) ([]byte, error) {
 	// 清洗 URL
 	rawURL = parse.CleanURL(rawURL)
 
@@ -57,6 +63,9 @@ func FetchSubsData(rawURL string) ([]byte, error) {
 
 	conf := config.GlobalConfig
 	maxRetries := max(1, conf.SubUrlsReTry)
+	if retryOverride != nil {
+		maxRetries = max(0, *retryOverride)
+	}
 	timeout := max(10, conf.SubUrlsTimeout)
 
 	// 处理为标准的GitHub raw地址

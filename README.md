@@ -148,6 +148,12 @@ WebUI 集成了配置编辑、订阅分享、订阅管理，内置文件服务�
 
 `http://localhost:8199/admin`
 
+### 🎛️ 高级订阅源策略
+
+在 `config.yaml` 的 `advanced-sub-urls` 下，可以为某个订阅源单独设置策略。来源策略与节点名称分开保存：`priority` 和 `count_toward_success_limit` 控制检测顺序与停止条件；`name_prefix` / `name_suffix` 只控制导出名称。所有字段示例和默认值见 [`config/config.yaml.example`](./config/config.yaml.example)。
+
+`count_toward_success_limit` 缺省时默认为 `true`。将其设为 `false` 后，该来源的可用节点仍计入实际可用统计，但不触发 `success-limit`。如需限制整轮检测规模，可同时设置 `max-total-tested`。
+
 ### 🐳 Docker 运行（最简）
 
 ```bash
@@ -287,6 +293,18 @@ speed-test-url: https://custom-domain/speedtest?bytes=1073741824
 ## 🤝 贡献与开发
 
 - 欢迎提交 PR 与 Issue，一起完善项目。
+
+### Windows 本地编译
+
+项目使用 QuickJS 的 CGO 绑定，Windows 编译需要 Go（版本见 [`go.mod`](./go.mod)）和 Zig，并确保 `go`、`zig` 都在 `PATH` 中。编译 Windows x64 版本：
+
+```powershell
+./go_build.ps1 -Debug -Win
+```
+
+生成的程序位于 `bin/Windows_x86_64/subs-check-pro.exe`。运行前请先准备 `config/config.yaml`；可复制 [`config/config.yaml.example`](./config/config.yaml.example) 后编辑订阅源及检测设置。
+
+安装 CGO 所需工具后，可用 `go test ./...` 检查 Go 包；Windows 交叉编译和正式构建建议使用上面的脚本，它会配置 Zig 交叉编译器。
 
 ```bash
 git clone https://github.com/sinspired/subs-check-pro
