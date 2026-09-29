@@ -57,6 +57,8 @@ type AdvancedSubUrlConfig struct {
 	NamePrefix              string   `yaml:"name_prefix"`
 	NameSuffix              string   `yaml:"name_suffix"`
 	KeepOnDead              bool     `yaml:"keep_on_dead"`
+	SkipAliveCheck          bool     `yaml:"skip_alive_check"`
+	SkipCountryFilter       bool     `yaml:"skip_country_filter"`
 	SkipSpeedtest           bool     `yaml:"skip_speedtest"`
 	RetryOnFail             *int     `yaml:"retry_on_fail"`
 	BypassDedupe            bool     `yaml:"bypass_dedupe"`
@@ -74,6 +76,8 @@ type SourcePolicy struct {
 	NamePrefix              string   `json:"name_prefix,omitempty" yaml:"-"`
 	NameSuffix              string   `json:"name_suffix,omitempty" yaml:"-"`
 	KeepOnDead              bool     `json:"keep_on_dead,omitempty" yaml:"-"`
+	SkipAliveCheck          bool     `json:"skip_alive_check,omitempty" yaml:"-"`
+	SkipCountryFilter       bool     `json:"skip_country_filter,omitempty" yaml:"-"`
 	SkipSpeedtest           bool     `json:"skip_speedtest,omitempty" yaml:"-"`
 	BypassDedupe            bool     `json:"bypass_dedupe,omitempty" yaml:"-"`
 	AllowCountries          []string `json:"allow_countries,omitempty" yaml:"-"`
@@ -105,6 +109,8 @@ func (s AdvancedSubUrlConfig) Policy(id string) SourcePolicy {
 		NamePrefix:              s.NamePrefix,
 		NameSuffix:              suffix,
 		KeepOnDead:              s.KeepOnDead,
+		SkipAliveCheck:          s.SkipAliveCheck,
+		SkipCountryFilter:       s.SkipCountryFilter,
 		SkipSpeedtest:           s.SkipSpeedtest,
 		BypassDedupe:            s.BypassDedupe,
 		AllowCountries:          append([]string(nil), s.AllowCountries...),

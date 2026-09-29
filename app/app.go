@@ -418,11 +418,12 @@ func (app *App) checkProxies() error {
 	app.lastCheck.time.Store(endTime)
 	app.lastCheck.duration.Store(int64(endTime.Sub(startTime).Seconds()))
 	app.lastCheck.Total.Store(int64(check.ProxyCount.Load()))
-	app.lastCheck.available.Store(int64(len(results)))
+	availableCount := check.CountAvailableResults(results)
+	app.lastCheck.available.Store(int64(availableCount))
 	app.lastCheck.traffic.Store(int64(check.TotalBytes.Load()))
 
 	check.CurrentStepName.Store("发送通知")
-	utils.SendNotifyCheckResult(len(results), check.CheckTrafficTotal)
+	utils.SendNotifyCheckResult(availableCount, check.CheckTrafficTotal)
 
 	check.CurrentStepName.Store("清理检测缓存")
 	// 切断所有大对象的应用

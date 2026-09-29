@@ -547,11 +547,17 @@ sub-urls:
 # count_toward_success_limit 省略时默认 true；设为 false 时，成功节点仍可导出，但不用于触发全局成功数上限。
 # name_prefix / name_suffix 输出时节点名的前缀或后缀，只控制导出显示名称，不参与排序或限额。
 # retry_on_fail 覆盖全局重试次数；0 表示不重试，未设置则沿用全局值。
-# keep_on_dead 将测活失败或无法创建检测客户端的节点也保留在 all/mihomo 输出中；失败节点不会进入历史成功列表。
+# keep_on_dead 将测活失败、测速未达标或无法创建检测客户端的节点也保留在 all/mihomo 输出中；失败节点不会进入历史成功列表。
+# 付费源建议设为 true，以免临时故障时丢失节点；这可能保留当前确实不可用的节点。
+# skip_alive_check 跳过 Google gstatic 连通性探测，仍会执行地区过滤及后续启用的测速/媒体检测。
+# 若跳过测活且本轮没有实际测速（全局未启用，或此来源跳过测速），节点属于“未验证”：可写入常规输出，但不计入成功数上限或历史成功列表。
 # skip_speedtest 只跳过测速，节点仍要先通过测活和地区筛选。
+# skip_country_filter 跳过全局 node-loc 与本来源 allow_countries 两种地区过滤，也不为过滤目的查询地区。
 # bypass_dedupe 保留此来源内及与其他来源重复的节点。
+# 付费源建议设为 true，以免付费源节点被其他来源的重复节点合并/丢弃；会产生重复节点。
 # allow_countries 额外限制此来源可接受的国家/地区；仍会遵守全局 node-loc 设置。
 # group_output 会在配置的输出目录/sub 下生成独立 YAML 文件，文件名会自动安全化。
+# 以下是“付费源保留优先”的示例；如不希望保留重复或失败节点，可将对应选项设为 false。
 advanced-sub-urls:
   # - url: 'https://example.com/sub.yaml'
   #   source_name: 'Example'
@@ -560,6 +566,8 @@ advanced-sub-urls:
   #   name_prefix: '[Example] '
   #   name_suffix: ''
   #   keep_on_dead: true
+  #   skip_alive_check: false
+  #   skip_country_filter: false
   #   skip_speedtest: false
   #   retry_on_fail: 2
   #   bypass_dedupe: true

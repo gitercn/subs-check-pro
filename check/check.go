@@ -125,6 +125,9 @@ type ProxyJob struct {
 	mediaMarked atomic.Bool
 
 	Speed int
+	// Validated is true after a real liveness or speed check succeeds. Skipped checks
+	// may still pass the pipeline, but must not count as available/successful.
+	Validated bool
 
 	NeedCF         bool
 	IsCfAccessible bool
@@ -524,7 +527,7 @@ func (pc *ProxyChecker) run(proxies []map[string]any) ([]Result, error) {
 	// 重置预计剩余时间计算
 	ETASeconds.Store(0)
 
-	slog.Info("可用节点数量", "count", pc.available.Load(), "保留结果数", len(pc.results))
+	slog.Info("检测结果数量", "已验证可用", CountAvailableResults(pc.results), "保留结果", len(pc.results))
 	CheckTrafficTotal = utils.FormatTraffic(TotalBytes.Load())
 	slog.Info(fmt.Sprintf("检测消耗流量: %s", CheckTrafficTotal))
 	slog.Debug("流量", "UP", UP.Load(), "DOWN", DOWN.Load())
@@ -676,8 +679,9 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, cancel context.Cancel
 					job.Close()
 					continue
 				}
-				// 节点测活
-				isAlive := checkAlive(job, ctx)
+				// 跳过测活时仍进入后续过滤/检测阶段；若之后也没有实际测速，
+				// 该节点可导出，但不会标记为可用或计入成功数量。
+				isAlive := job.Source.SkipAliveCheck || checkAlive(job, ctx)
 
 				if !isAlive {
 					// 记录非存活
@@ -705,8 +709,8 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, cancel context.Cancel
 					}
 				}
 
-				// 地区过滤
-				if !job.checkJobLocation(db, ctx) {
+				// 地区过滤可按来源跳过；跳过时既不查归属地，也忽略全局和来源地区限制。
+				if !job.Source.SkipCountryFilter && !job.checkJobLocation(db, ctx) {
 					if job.aliveMarked.CompareAndSwap(false, true) {
 						pc.pt.CountAlive(false)
 					}
@@ -715,6 +719,7 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, cancel context.Cancel
 				}
 
 				// 通过全部过滤，记录为存活
+				job.Validated = !job.Source.SkipAliveCheck
 				if job.aliveMarked.CompareAndSwap(false, true) {
 					pc.pt.CountAlive(true)
 				}
@@ -724,7 +729,9 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, cancel context.Cancel
 					if job.Source.SkipSpeedtest {
 						if job.speedMarked.CompareAndSwap(false, true) {
 							pc.pt.CountSpeed(true)
-							pc.incrementAvailable(job.Source)
+							if job.Validated {
+								pc.incrementAvailable(job.Source)
+							}
 							if config.GlobalConfig.SuccessLimit > 0 &&
 								pc.countedAvailable.Load() >= config.GlobalConfig.SuccessLimit {
 								Successlimited.Store(true)
@@ -741,7 +748,7 @@ func (pc *ProxyChecker) runAliveStage(ctx context.Context, cancel context.Cancel
 					}
 				} else {
 					// 无测速时：通过 alive 即可视为“可用”，确保 Available 与最终可用数量一致
-					if job.speedMarked.CompareAndSwap(false, true) {
+					if job.speedMarked.CompareAndSwap(false, true) && job.Validated {
 						pc.incrementAvailable(job.Source)
 					}
 					select {
@@ -793,9 +800,17 @@ func (pc *ProxyChecker) runSpeedStage(ctx context.Context, cancel context.Cancel
 					}
 				}
 				if !success {
+					if job.Source.KeepOnDead {
+						// Keep rejected speed-test results for sources that explicitly
+						// prefer retaining paid nodes; they are not marked available.
+						job.Result.Available = false
+						applySourceName(&job.Result, job.Source)
+						pc.resultChan <- job.Result
+					}
 					job.Close()
 					continue
 				}
+				job.Validated = true
 				job.Speed = speed
 
 				if config.GlobalConfig.SuccessLimit > 0 && pc.countedAvailable.Load() >= config.GlobalConfig.SuccessLimit {
@@ -897,7 +912,7 @@ func (pc *ProxyChecker) runMediaStageAndCollect(db *maxminddb.Reader, ctx contex
 				// 将结果发送到 collector
 				// 只有走完整个测活/测速链路并进入结果阶段的节点才算可用；
 				// KeepOnDead 保留的失败节点会以 Available=false 导出。
-				job.Result.Available = true
+				job.Result.Available = job.Validated
 				pc.resultChan <- job.Result
 
 				if job.mediaMarked.CompareAndSwap(false, true) {
@@ -1485,6 +1500,18 @@ func (pc *ProxyChecker) incrementAvailable(source config.SourcePolicy) {
 	if source.CountTowardSuccessLimit {
 		pc.countedAvailable.Add(1)
 	}
+}
+
+// CountAvailableResults returns only nodes that passed a real liveness or speed check.
+// Kept dead or deliberately unverified nodes remain in results but are not available.
+func CountAvailableResults(results []Result) int {
+	count := 0
+	for _, result := range results {
+		if result.Available {
+			count++
+		}
+	}
+	return count
 }
 
 // checkCtxDone 提供一个非阻塞的检查，判断上下文是否已结束或是否收到强制关闭信号。

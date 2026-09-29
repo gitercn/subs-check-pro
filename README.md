@@ -150,9 +150,9 @@ WebUI 集成了配置编辑、订阅分享、订阅管理，内置文件服务�
 
 ### 🎛️ 高级订阅源策略
 
-在 `config.yaml` 的 `advanced-sub-urls` 下，可以为某个订阅源单独设置策略。来源策略与节点名称分开保存：`priority` 和 `count_toward_success_limit` 控制检测顺序与停止条件；`name_prefix` / `name_suffix` 只控制导出名称。所有字段示例和默认值见 [`config/config.yaml.example`](./config/config.yaml.example)。
+在 `config.yaml` 的 `advanced-sub-urls` 下，可以为某个订阅源单独设置策略。来源策略与节点名称分开保存：`priority` 和 `count_toward_success_limit` 控制检测顺序与停止条件；`name_prefix` / `name_suffix` 只控制导出名称。来源也可以跳过测活、地区过滤或测速。所有字段示例和注意事项见 [`config/config.yaml.example`](./config/config.yaml.example)。
 
-`count_toward_success_limit` 缺省时默认为 `true`。将其设为 `false` 后，该来源的可用节点仍计入实际可用统计，但不触发 `success-limit`。如需限制整轮检测规模，可同时设置 `max-total-tested`。
+`count_toward_success_limit` 缺省时默认为 `true`。将其设为 `false` 后，该来源的已验证可用节点仍计入实际可用统计，但不触发 `success-limit`。通过 `keep_on_dead` 保留的测活失败、测速未达标节点，以及跳过测活且未测速的未验证节点会写入常规输出，但不计入成功数或 `history.yaml`。地区/Cloudflare 过滤仍按配置执行。如需限制整轮检测规模，可同时设置 `max-total-tested`。
 
 ### 🐳 Docker 运行（最简）
 
